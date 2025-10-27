@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "knightmesh.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "knightmesh.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    module-name: {{ .Values.module.name | quote }}
+    module-type: {{ .Values.module.type | quote }}
+    {{- with .Values.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "knightmesh.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP

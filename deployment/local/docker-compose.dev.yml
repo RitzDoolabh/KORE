@@ -1,0 +1,161 @@
+version: '3.9'
+
+# Quick local dev stack: Postgres, Keycloak, and one instance each of Gateway, MGM, SPM.
+# Optional: Prometheus + Grafana + Jaeger via compose profiles (use --profile monitoring).
+services:
+  postgres:
+    image: postgres:16
+    container_name: km-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-knightmesh}
+      POSTGRES_USER: ${POSTGRES_USER:-km}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kmPass!}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-km} -d ${POSTGRES_DB:-knightmesh}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.3
+    container_name: km-keycloak
+    restart: unless-stopped
+    command: ["start-dev", "--http-port=8080", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: ${KC_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD:-admin}
+      # Ensure tokens/issuer reference the in-cluster hostname for validation by Gateway
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY: "edge"
+      KEYCLOAK_FRONTEND_URL: http://keycloak:8080/
+    volumes:
+      - ./keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
+      - keycloak-data:/opt/keycloak/data
+    depends_on:
+      postgres:
+        condition: service_started
+    ports:
+      - "8080:8080"  # Keycloak admin UI at http://localhost:8080
+
+  mgm:
+    container_name: km-mgm
+    build:
+      context: ../../mgm
+      dockerfile: Dockerfile
+    image: knightmesh/mgm:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-dev}
+      # Point MGM to Postgres
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-knightmesh}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-km}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-kmPass!}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: none
+      SPRING_JPA_SHOW_SQL: "false"
+      SPRING_FLYWAY_ENABLED: "true"
+      # Seed desired state on first run
+      MGM_SEED: "true"
+      # Observability (optional)
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4317}
+      observability.module: mgm
+      observability.module_type: MGM
+      observability.instance_id: local-mgm
+    ports:
+      - "8085:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  spm:
+    container_name: km-spm
+    build:
+      context: ../../modules/spm
+      dockerfile: Dockerfile
+    image: knightmesh/spm:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-dev}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4317}
+      observability.module: spm
+      observability.module_type: SPM
+      observability.instance_id: local-spm
+    ports:
+      - "8081:8080"
+    depends_on:
+      mgm:
+        condition: service_started
+
+  gateway:
+    container_name: km-gateway
+    build:
+      context: ../../gateway
+      dockerfile: Dockerfile
+    image: knightmesh/gateway:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-dev}
+      # Point JWT validator to Keycloak issuer inside the compose network
+      OIDC_ISSUER_URI: http://keycloak:8080/realms/knightmesh
+      # Configure fallback routes to internal service names
+      GATEWAY_MGM_URI: http://mgm:8085
+      GATEWAY_IRP_URI: http://irp:8080
+      GATEWAY_SPM_URI: http://spm:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4317}
+      observability.module: gateway
+      observability.module_type: GATEWAY
+      observability.instance_id: local-gateway
+    ports:
+      - "8088:8080"   # Public Gateway endpoint at http://localhost:8088
+    depends_on:
+      keycloak:
+        condition: service_started
+      mgm:
+        condition: service_started
+      spm:
+        condition: service_started
+
+  # Optional monitoring stack (enable with: --profile monitoring)
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:latest
+    container_name: km-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:latest
+    container_name: km-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+
+  jaeger:
+    profiles: ["monitoring"]
+    image: jaegertracing/all-in-one:1.57
+    container_name: km-jaeger
+    restart: unless-stopped
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+
+volumes:
+  postgres-data:
+  keycloak-data:

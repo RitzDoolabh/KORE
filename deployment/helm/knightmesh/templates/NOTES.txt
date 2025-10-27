@@ -1,0 +1,17 @@
+Thank you for installing Knightmesh.
+
+To deploy a module, set the image repository/tag and module info:
+
+Example:
+  helm upgrade --install spm ./deployment/helm/knightmesh \
+    --set image.repository=knightmesh/spm \
+    --set image.tag=latest \
+    --set module.name=spm \
+    --set module.type=SPM \
+    --set replicaCount=1
+
+Service URL (if ingress enabled):
+  http(s)://<host>/
+
+To see rendered manifest:
+  helm template test ./deployment/helm/knightmesh --set image.repository=knightmesh/spm --set module.name=spm

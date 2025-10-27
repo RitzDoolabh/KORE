@@ -1,0 +1,6 @@
+apiVersion: v2
+name: knightmesh
+version: 0.1.0
+description: Helm chart for deploying Knightmesh modules (SPM, IRP, QPM, MGM, Gateway)
+type: application
+appVersion: "0.1.0"

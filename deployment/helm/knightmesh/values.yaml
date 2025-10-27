@@ -1,0 +1,52 @@
+# Global defaults
+image:
+  repository: knightmesh/app
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+module:
+  name: spm
+  type: SPM
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  className: nginx
+  hosts:
+    - host: knightmesh.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+
+env:
+  - name: SPRING_PROFILES_ACTIVE
+    value: "k8s"
+  - name: JAVA_OPTS
+    value: "-XX:MaxRAMPercentage=75.0 -Djava.security.egd=file:/dev/./urandom"
+
+envFrom:
+  # Example references; leave empty by default
+  configMaps: []
+  secrets: []
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Optional extra labels for Deployment/Service
+extraLabels: {}

@@ -1,0 +1,30 @@
+plugins {
+    id 'java'
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter'
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.boot:spring-boot-starter-aop'
+
+    implementation 'io.github.resilience4j:resilience4j-spring-boot3'
+
+    implementation 'org.flywaydb:flyway-core'
+    implementation 'org.flywaydb:flyway-database-postgresql'
+    implementation 'org.springframework.cloud:spring-cloud-commons'
+    runtimeOnly 'org.postgresql:postgresql'
+
+    implementation project(':platform-core')
+    implementation project(':modules:spm')
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    // In-memory H2 for unit tests where DB not required
+    testImplementation 'com.h2database:h2'
+
+    // Testcontainers for Postgres-backed integration tests
+    testImplementation 'org.testcontainers:junit-jupiter'
+    testImplementation 'org.testcontainers:postgresql'
+    testImplementation 'org.springframework.boot:spring-boot-testcontainers'
+}

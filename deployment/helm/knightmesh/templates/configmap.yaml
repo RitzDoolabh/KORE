@@ -1,0 +1,13 @@
+{{- if .Values.envConfig }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "knightmesh.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "knightmesh.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    module-name: {{ .Values.module.name | quote }}
+    module-type: {{ .Values.module.type | quote }}
+data:
+{{- toYaml .Values.envConfig | nindent 2 }}
+{{- end }}
