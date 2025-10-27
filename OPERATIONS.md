@@ -195,3 +195,132 @@ Backup/Restore (DB):
 ---
 
 If you operate Knightmesh in multiple environments, maintain separate Helm values files (e.g., `values-dev.yaml`, `values-staging.yaml`, `values-prod.yaml`) and apply via `-f` flags. Ensure environment‑specific Keycloak issuer URIs, DB URLs, and per‑service thread capacities are configured accordingly.
+
+
+---
+
+## Verified architecture and flows (operations perspective)
+
+This section maps runtime behaviors directly to code, helping you diagnose issues with confidence.
+
+- Request authorization and routing (Gateway)
+  - Code: `gateway/src/main/java/org/knightmesh/gateway/SecurityConfig.java`
+    - Enforces roles: `/mgm/**` → `ROLE_ADMIN`, `/irp/**` → `ROLE_USER`, `/spm/**` → `ROLE_SERVICE`.
+  - Code: `gateway/src/main/java/org/knightmesh/gateway/RouteConfig.java`
+    - Builds routes from DB (`GatewayRoute`) when available, else uses static fallbacks (`gateway.*.uri`).
+    - JWT `Authorization` header is preserved and forwarded (covered by `GatewaySecurityIntegrationTest`).
+
+- Ingress (IRP) behavior
+  - Code: `modules/irp/src/main/java/org/knightmesh/irp/IrpController.java`
+    - Endpoint: `POST /irp/{serviceName}`; builds `ServiceRequest` with `metadata.timestamp` and `source=IRP`.
+    - Reads `ModuleConfig` via `ConfigRepository.getModuleConfig("irp")` to decide `DIRECT` vs `QUEUE`.
+
+- Local service execution and capacity
+  - Code: `module-runtime/.../LocalServiceRegistry.java` and `LocalServiceDescriptor.java`
+    - Registration logs at INFO and registers Micrometer gauges per service.
+    - `capacitySnapshot()` powers `/spm|/irp|/qpm/capacity` endpoints via `CapacityController`.
+
+- Routing and resilience
+  - Code: `module-runtime/.../ServiceRouter.java`
+    - Local‑first path: `incrementActive()` → `execute()` → `decrementActive()` in `finally`.
+    - Remote path: `RemoteServiceLocator.findInstances()` → `RemoteHttpInvoker.post()` → `/internal/service/{serviceName}`.
+    - Error codes returned by router (as `ServiceResponse.failure(errorCode, message, data)`):
+      - `INVALID_REQUEST` – null request or service name
+      - `NO_INSTANCES` – discovery returned empty list
+      - `EMPTY_RESPONSE` – HTTP returned no body
+      - `SERVICE_UNAVAILABLE` – failures after retries or circuit open
+      - `NO_REMOTE_PATH` – neither `RemoteServiceLocator` nor kube fallback present
+      - `EXCEPTION` – local execution threw a `RuntimeException`
+
+- Discovery (Kubernetes or DB fallback)
+  - Code: `module-runtime/.../KubernetesRemoteServiceLocator.java`
+    - Uses Spring Cloud `DiscoveryClient` when env `KUBERNETES_SERVICE_HOST` is present (or property flag).
+    - Otherwise, reads `ModuleConfig.extraJson` with shape `{ "instances": [{"host":"...","port":1234, "metadata":{...}}] }`.
+
+- Queue processing (QPM)
+  - Code: `modules/qpm/src/main/java/org/knightmesh/qpm/QpmWorker.java`
+    - Polls queues for modules configured with `RouteMode=QUEUE` and `queueName`, drains up to batch size (50), and routes each message.
+
+---
+
+## PromQL quick reference (maps to code metrics)
+
+- Requests per service (5m rate)
+  - `sum by (service_name) (rate(router_requests_total[5m]))`
+- Local vs remote ratio (5m)
+  - `sum by (route) (rate(router_requests_total[5m]))`
+- Thread utilization per service
+  - `avg by (service_name) (spm_thread_utilization)`
+- Active vs Max threads
+  - `sum by (service_name) (spm_active_threads)` vs `sum by (service_name) (spm_max_threads)`
+
+Each metric automatically has common tags attached: `module`, `module_type`, `instance_id` (from `ObservabilityConfig`).
+
+---
+
+## Resilience4j configuration knobs
+
+These properties control remote HTTP retry and circuit breaker used by `RemoteHttpInvoker` / `ServiceRouter`.
+
+- Retry (`remoteRouter` instance)
+  - `resilience4j.retry.instances.remoteRouter.max-attempts`
+  - `resilience4j.retry.instances.remoteRouter.wait-duration`
+  - `resilience4j.retry.instances.remoteRouter.enable-exponential-backoff`
+  - `resilience4j.retry.instances.remoteRouter.exponential-backoff-multiplier`
+- Circuit breaker (`remoteRouter` instance)
+  - `resilience4j.circuitbreaker.instances.remoteRouter.sliding-window-size`
+  - `resilience4j.circuitbreaker.instances.remoteRouter.minimum-number-of-calls`
+  - `resilience4j.circuitbreaker.instances.remoteRouter.failure-rate-threshold`
+  - `resilience4j.circuitbreaker.instances.remoteRouter.wait-duration-in-open-state`
+
+Defaults for tests are in `module-runtime/src/test/resources/application-test.properties`; adjust in production via module properties or environment variables.
+
+---
+
+## Troubleshooting playbook
+
+- 401/403 at Gateway
+  - Ensure JWT is present and roles match path policy (ADMIN for `/mgm/**`, USER for `/irp/**`).
+  - Verify `spring.security.oauth2.resourceserver.jwt.issuer-uri` points to your Keycloak realm.
+- IRP returns 400 with `FAILURE`
+  - Look for `errorCode` in body. Common cases:
+    - `NO_INSTANCES` – discovery returned empty list; check Kubernetes discovery or DB fallback `extraJson`.
+    - `SERVICE_UNAVAILABLE` – retry budget exhausted or circuit open; see Resilience4j section and check remote service health.
+    - `EXCEPTION` – local service threw; inspect service logs.
+- Requests are slow or backpressure observed
+  - Inspect `spm_thread_utilization` and `router_latency`; consider raising `ServiceMetrics.maxThreads` or scaling replicas.
+- Capacity endpoints show no services
+  - Ensure `@CKServiceRegistration` annotations exist and that `LocalServiceAutoRegistrar` ran (check startup logs for registrations).
+- Remote routing never triggers
+  - If you expect remote but execution is local, you may have the service registered locally. Deregister or lower local `maxThreads` to test remote fallback.
+
+---
+
+## Operational sequences
+
+1) Scale SPM capacity safely
+   - Increase `ServiceMetrics.maxThreads` in code (and redeploy), or scale pod replicas via Helm.
+   - Monitor `spm_thread_utilization` and CPU usage before/after.
+
+2) Force MGM reconcile (simulated or real controller)
+   - `POST /mgm/reconcile` via Gateway (ADMIN role). In simulation, this refreshes the in‑memory desired state.
+
+3) Switch IRP from DIRECT to QUEUE
+   - Update `module_config.route_mode` for name `irp` to `QUEUE` and set `queue_name`.
+   - Ensure `QpmWorker` is running; monitor queue sizes (`QueuePlugin.size()` exposed via logs if instrumented) and router metrics.
+
+4) Update Gateway routes from DB
+   - Insert/modify `gateway_route` rows; call any endpoint that triggers `ConfigRepository.reload()` (or restart Gateway if not hot‑reloading).
+   - Verify path policies using `RequiredRolesGatewayFilterFactory` (roles CSV must include required roles).
+
+---
+
+## Security notes
+
+- Actuator exposure
+  - In dev, `/actuator/prometheus` is open. In prod, restrict via network policies or require auth on a sidecar/proxy.
+- Token forwarding
+  - Gateway forwards the `Authorization` header; downstream services can perform additional checks if desired.
+- Service role separation
+  - Use the `SERVICE` realm role for internal routes like `/spm/**` when exposing them via Gateway for internal clients.
+

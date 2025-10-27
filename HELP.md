@@ -102,3 +102,80 @@ docker compose --env-file deployment/local/.env \
 docker compose -f deployment/local/docker-compose.dev.yml down -v
 ```
 This removes the volume and all data.
+
+
+---
+
+## How the pieces fit together (quick reference)
+
+- Contracts and models live in `platform-core` (`CKService`, `ServiceRequest`, `ServiceResponse`).
+- Runtime wiring lives in `module-runtime` (LocalServiceRegistry, ServiceRouter, discovery, resilience, metrics).
+- Business services live in SPM (`modules/spm/.../services`). They are auto‑registered by `LocalServiceAutoRegistrar`.
+- IRP receives external requests (`POST /irp/{serviceName}`) and either routes DIRECT to ServiceRouter or enqueues (QUEUE mode) using `QueuePlugin`.
+- QPM dequeues and routes to ServiceRouter.
+- Gateway enforces JWT roles and proxies to IRP/MGM/SPM; it forwards the `Authorization` header to downstream modules.
+- MGM exposes desired state APIs and (in simulation mode) logs reconcile actions.
+
+### End‑to‑end flow (DIRECT)
+1) Client → Gateway `/irp/REGISTER_USER` with `Authorization: Bearer <jwt>` (role USER)
+2) Gateway validates JWT and forwards to IRP
+3) IRP builds `ServiceRequest` and calls `ServiceRouter.route(..)`
+4) Router executes `REGISTER_USER` locally (capacity permitting) and it invokes `USER_AUTH` via `ServiceInvoker`
+5) IRP returns `ServiceResponse` to client via Gateway
+
+### End‑to‑end flow (QUEUE)
+1) Client → Gateway `/irp/REGISTER_USER` (role USER)
+2) IRP enqueues request using `QueuePlugin` and returns 202 `{correlationId}`
+3) QPM drains the queue and calls `ServiceRouter`
+
+See README “Deep architecture and request flows” for code‑level details.
+
+---
+
+## Useful endpoints and commands
+
+- Health/metrics
+  - `GET /actuator/health` (all modules)
+  - `GET /actuator/prometheus` (all modules)
+- Capacity
+  - `GET /spm/capacity`, `/irp/capacity`, `/qpm/capacity`
+- MGM APIs
+  - `GET /mgm/modules`
+  - `POST /mgm/reconcile`
+- IRP
+  - `POST /irp/{serviceName}` – JSON body is the payload map
+
+Curl examples (via Gateway):
+```
+# Acquire JWT for devuser (USER)
+export TOKEN=$(curl -s -X POST \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=password' \
+  -d 'client_id=knightmesh-gateway' \
+  -d 'username=devuser' -d 'password=password' \
+  http://localhost:8080/realms/knightmesh/protocol/openid-connect/token | jq -r .access_token)
+
+curl -s -X POST http://localhost:8088/irp/REGISTER_USER \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","email":"alice@example.org"}' | jq .
+```
+
+---
+
+## Quick troubleshooting
+
+- 401/403 at Gateway
+  - Missing/invalid token or insufficient role; check `OIDC_ISSUER_URI` and Keycloak realm users/roles
+- IRP returns `FAILURE`
+  - Inspect `errorCode` in JSON: `NO_INSTANCES`, `SERVICE_UNAVAILABLE`, `EXCEPTION` etc.; see OPERATIONS.md for remedies
+- Slow or saturated
+  - Check Prometheus metrics: `spm_thread_utilization`, `router_latency`, `router_requests_total` (route=remote)
+
+---
+
+## Links to detailed docs
+
+- Deep architecture and flows: see README (appendix)
+- Developer guide (adding services/plugins, tests): DEVELOPMENT.md
+- Operations guide (metrics, tracing, scaling, reconcile): OPERATIONS.md

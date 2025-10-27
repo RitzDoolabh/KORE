@@ -224,3 +224,134 @@ Tips:
 ## Learn more
 - Development guide: [DEVELOPMENT.md](DEVELOPMENT.md)
 - Operations guide: [OPERATIONS.md](OPERATIONS.md)
+
+
+---
+
+## Deep architecture and request flows (verified against source)
+
+This appendix explains, in detail, how the platform is wired internally. It cites concrete classes, methods, and endpoints present in this repo so you can confidently trace an end‑to‑end request.
+
+### Core contracts (platform-core)
+- Service contract: `org.knightmesh.core.service.CKService`
+  - `String getServiceName()` – logical name, e.g. `"REGISTER_USER"`.
+  - `ServiceResponse execute(ServiceRequest request)` – synchronous execution.
+  - `ServiceMetrics getMetrics()` – provides `maxThreads` used for capacity.
+- Models (package `org.knightmesh.core.model`):
+  - `ServiceRequest(String serviceName, Map<String,Object> payload, Map<String,String> metadata, String correlationId)`.
+  - `ServiceResponse` with `enum Status { SUCCESS, FAILURE }` and `success(..)/failure(..)` factories.
+  - `ServiceMetrics(int maxThreads, double avgLatencyMs, long successCount, long failureCount)`.
+- Registration annotation: `org.knightmesh.core.annotations.CKServiceRegistration(name=...)` – marks services for auto‑registration.
+- Config entities (package `org.knightmesh.core.config`): `ModuleConfig`, `ServiceConfig`, `GatewayRoute`, etc.
+
+### Runtime (module-runtime)
+- Local descriptor: `org.knightmesh.runtime.registry.LocalServiceDescriptor`
+  - Fields include `serviceName`, `CKService instance`, `AtomicInteger activeThreads`, `int maxThreads`, `ServiceStatus status`, `Instant lastHeartbeat`.
+  - Methods: `hasCapacity()`, `incrementActive()`, `decrementActive()`, getters.
+- Local registry: `org.knightmesh.runtime.registry.LocalServiceRegistry`
+  - Thread‑safe `ConcurrentHashMap<String, LocalServiceDescriptor>` store.
+  - `register(LocalServiceDescriptor)` updates `lastHeartbeat`, logs, and registers Micrometer gauges:
+    - `spm_active_threads{service_name}`
+    - `spm_max_threads{service_name}`
+    - `spm_thread_utilization{service_name}`
+  - `lookup`, `listAll`, `deregister`, `capacitySnapshot()`.
+- Auto‑registration: `org.knightmesh.runtime.registry.LocalServiceAutoRegistrar`
+  - Listens on `ContextRefreshedEvent`, finds beans of type `CKService` and/or annotated with `@CKServiceRegistration` and calls `LocalServiceRegistry.register(..)` using `getMetrics().getMaxThreads()` (defaults applied if invalid).
+- Router: `org.knightmesh.runtime.router.ServiceRouter`
+  - Local‑first and remote‑fallback routing:
+    1) Lookup `LocalServiceDescriptor` by `request.serviceName`.
+    2) If present and `hasCapacity()`:
+       - CAS reserve via `incrementActive()`, then `try/finally` execute `descriptor.getInstance().execute(request)` and `decrementActive()`.
+       - Record metrics: `router_requests_total{service_name,route="local",outcome}` and `router_latency{..}`.
+    3) Else, remote flow `routeRemote(..)`:
+       - Discover instances using `RemoteServiceLocator` (preferred) or fall back to `KubernetesServiceLocator` stub if wired.
+       - Select instance round‑robin; POST `ServiceRequest` to `/internal/service/{serviceName}` using `RemoteHttpInvoker`.
+       - Resilience with Resilience4j: `@Retry(name="remoteRouter")` and `@CircuitBreaker(name="remoteRouter")` around HTTP calls; failures map to `ServiceResponse.failure("SERVICE_UNAVAILABLE", ..)`; open circuit maps to `ServiceResponse.failure("SERVICE_UNAVAILABLE", "Circuit open for remote service: "+svc, null)`.
+
+- HTTP invoker: `org.knightmesh.runtime.router.RemoteHttpInvoker`
+  - Method `post(ServiceInstance, ServiceRequest)` posts to `/internal/service/{serviceName}` on the chosen instance using a `RestTemplate` bean defined in `RemoteHttpConfig`.
+  - Annotated with Resilience4j retry and circuit breaker; null responses are treated as errors.
+
+- Discovery: `org.knightmesh.runtime.router.KubernetesRemoteServiceLocator`
+  - If env `KUBERNETES_SERVICE_HOST` is present (or property), uses Spring Cloud `DiscoveryClient` to find instances by name.
+  - Else, DB fallback: parses `ModuleConfig.extraJson` for `instances: [{host,port,metadata}]` and returns a list of `ServiceInstance`.
+
+### Ingress (IRP)
+- App: `org.knightmesh.irp.IrpApplication` (scans `org.knightmesh` packages).
+- Controller: `org.knightmesh.irp.IrpController`
+  - Endpoint: `POST /irp/{serviceName}` accepts JSON `payload` (mapped to `Map<String,Object>`).
+  - Builds `ServiceRequest` with `correlationId=UUID.randomUUID()` and metadata `{timestamp, source=IRP}`.
+  - Reads route mode via `ConfigRepository.getModuleConfig("irp")` → `ModuleConfig.routeMode`.
+    - `DIRECT` (default): call `ServiceRouter.route(request)` and return `ServiceResponse` (HTTP 200 on SUCCESS else 400).
+    - `QUEUE`: send to `QueuePlugin.enqueue(queueNameOrDefault, request)` and return HTTP 202 with `{status: "ACCEPTED", correlationId}`.
+
+### Service Processing Module (SPM)
+- App: `org.knightmesh.spm.SpmApplication` (scans `org.knightmesh`).
+- Sample services: `org.knightmesh.spm.services.RegisterUserService` and `UserAuthService`, both annotated with `@CKServiceRegistration` so the `LocalServiceAutoRegistrar` registers them with the local registry.
+  - `RegisterUserService`: validates payload (`username`, `email`), simulates persistence (logs), then invokes `USER_AUTH` via `ServiceInvoker` and aggregates the response.
+  - `UserAuthService`: simulates authentication, returns `ServiceResponse.success` with a token.
+
+### Queue Processor Module (QPM)
+- App: `org.knightmesh.qpm.QpmApplication` with `@EnableScheduling`.
+- Worker: `org.knightmesh.qpm.QpmWorker`
+  - On schedule (`qpm.poll.delay.ms`, default 250ms), lists enabled modules; for those with `RouteMode=QUEUE` and a `queueName`, drains messages using configured `QueuePlugin.dequeue(queueName)` up to a batch size (50) and routes each via `ServiceRouter`.
+
+### Gateway
+- App: `org.knightmesh.gateway.GatewayApplication` (WebFlux).
+- Security: `org.knightmesh.gateway.SecurityConfig`
+  - Configured as a resource server that validates JWTs from Keycloak (`OIDC_ISSUER_URI`).
+  - Maps Keycloak roles from `realm_access.roles` and `resource_access.*.roles` to `ROLE_*` authorities.
+  - Authorization rules:
+    - `/mgm/**` → `ROLE_ADMIN`
+    - `/irp/**` → `ROLE_USER`
+    - `/spm/**` → `ROLE_SERVICE`
+  - `/actuator/health` and OPTIONS requests are permitted.
+- Routes: `org.knightmesh.gateway.RouteConfig`
+  - If DB has `GatewayRoute` rows via `ConfigRepository.listGatewayRoutes()`, builds routes dynamically and applies `RequiredRolesGatewayFilterFactory` when `requiredRoles` is set.
+  - Else, static fallbacks map `/mgm/**`, `/irp/**`, `/spm/**` to URIs from properties and preserve the `Authorization` header so downstream modules receive the JWT.
+
+### Mesh Grid Manager (MGM)
+- App: `org.knightmesh.mgm.MgmApplication`.
+- Controller: `org.knightmesh.mgm.api.MgmController`
+  - `GET /mgm/modules` → lists desired modules from the DB via `ConfigRepository.listEnabledModules()`.
+  - `POST /mgm/modules/{name}/start|stop` and `POST /mgm/reconcile` → simulated responses unless a real K8s controller is enabled.
+
+### Observability
+- Common Micrometer tags are applied via `org.knightmesh.runtime.monitoring.ObservabilityConfig`:
+  - `module`, `module_type`, `instance_id` from `observability.*` properties.
+- Capacity endpoints are exposed by `org.knightmesh.runtime.monitoring.CapacityController`:
+  - `/spm/capacity`, `/irp/capacity`, `/qpm/capacity` (returns `LocalServiceRegistry.CapacityView` per service).
+- Router metrics: `router_requests_total` and `router_latency` with tags `service_name`, `route`, `outcome`.
+- Thread gauges per service: `spm_active_threads`, `spm_max_threads`, `spm_thread_utilization`.
+
+### Data model overview (Flyway migrations V1..V3)
+- `module_config` (desired modules): name, type, instance, domain, enabled, route_mode, queue_name, services, extra_json, created/updated.
+- `service_config` (per service in a module): service_name (unique), module_name, max_threads, enabled, config_json.
+- `gateway_route` (gateway path/routing rules): path_pattern, uri, required_roles, strip_prefix, filters_json, enabled.
+- Persistent queue table when using `PersistentQueuePlugin`: `persistent_queue_message` (id, queue_name, payload_json, status, created_at).
+
+### End‑to‑end request sequences
+1) Direct local execution (Gateway → IRP → SPM local):
+   - Gateway verifies JWT (`ROLE_USER`) and forwards `/irp/REGISTER_USER` to IRP.
+   - IRP builds `ServiceRequest(correlationId, metadata)` and sees `RouteMode=DIRECT`.
+   - ServiceRouter finds local `LocalServiceDescriptor(REGISTER_USER)` with capacity, reserves a slot, executes `RegisterUserService.execute` and releases.
+   - `RegisterUserService` invokes `USER_AUTH` via `ServiceInvoker` which routes locally to `UserAuthService`.
+   - IRP returns `ServiceResponse(Status=SUCCESS)` to Gateway; Gateway returns 200 JSON.
+
+2) Remote fallback (local full → remote instance):
+   - Local descriptor exists but its `activeThreads == maxThreads`.
+   - Router calls `RemoteServiceLocator.findInstances("REGISTER_USER")` to get remote `ServiceInstance` list.
+   - Router selects round‑robin, `RemoteHttpInvoker.post(..)` to `/internal/service/REGISTER_USER` with retry + circuit breaker.
+   - On success, returns remote `ServiceResponse` to IRP/Gateway; on repeated failure, returns `FAILURE` with `errorCode=SERVICE_UNAVAILABLE`.
+
+3) Asynchronous path (QUEUE):
+   - IRP sees `RouteMode=QUEUE` with `queueName` from `ModuleConfig` and enqueues via `QueuePlugin.enqueue`.
+   - Returns 202 `{status: "ACCEPTED", correlationId}` immediately.
+   - QPM’s `QpmWorker` dequeues and submits each `ServiceRequest` to `ServiceRouter`; responses are logged/observed via metrics.
+
+For concrete examples, see tests:
+- Local path: `module-runtime/src/test/java/.../ServiceRouterLocalTest.java`
+- Remote path & retry/circuit: `ServiceRouterRemoteTest`, `ServiceRouterRetryTest`, `ServiceRouterCircuitBreakerTest`
+- IRP direct: `modules/irp/.../IrpDirectIntegrationTest.java`
+- IRP remote fallback: `modules/irp/.../IrpRemoteFallbackIntegrationTest.java`
+- Gateway auth/forward: `gateway/.../GatewaySecurityIntegrationTest.java`

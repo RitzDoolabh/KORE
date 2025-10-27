@@ -208,3 +208,138 @@ Images:
 ---
 
 Happy hacking! If you add a new module or plugin, consider adding a short README in that subproject describing its endpoints, configuration, and any DB migrations. 
+
+
+---
+
+## Source map: where to find things (by module)
+
+- platform-core
+  - Contracts and models
+    - `platform-core/src/main/java/org/knightmesh/core/service/CKService.java`
+    - `platform-core/src/main/java/org/knightmesh/core/model/{ServiceRequest,ServiceResponse,ServiceMetrics}.java`
+    - `platform-core/src/main/java/org/knightmesh/core/annotations/CKServiceRegistration.java`
+  - Config entities (JPA)
+    - `platform-core/src/main/java/org/knightmesh/core/config/{ModuleConfig,ServiceConfig,GatewayRoute,...}.java`
+- module-runtime
+  - Registry and descriptors
+    - `module-runtime/src/main/java/org/knightmesh/runtime/registry/{LocalServiceRegistry,LocalServiceDescriptor,ServiceStatus}.java`
+    - Auto registration: `.../LocalServiceAutoRegistrar.java`
+  - Router and discovery
+    - `module-runtime/src/main/java/org/knightmesh/runtime/router/ServiceRouter.java`
+    - `module-runtime/src/main/java/org/knightmesh/runtime/router/{RemoteServiceLocator,KubernetesRemoteServiceLocator,ServiceInstance}.java`
+    - HTTP invoker + client: `RemoteHttpInvoker.java`, `RemoteHttpConfig.java`
+  - Monitoring
+    - `module-runtime/src/main/java/org/knightmesh/runtime/monitoring/{ObservabilityConfig,CapacityController}.java`
+  - Config repository + Spring Data repos
+    - `module-runtime/src/main/java/org/knightmesh/runtime/config/ConfigRepository.java`
+    - `module-runtime/src/main/java/org/knightmesh/runtime/config/repo/*.java`
+  - DB migrations (Flyway)
+    - `module-runtime/src/main/resources/db/migration/V1__init_config_tables.sql`
+    - `V2__align_config_schema.sql`, `V3__gateway_routes.sql`
+- modules
+  - IRP app and controller
+    - `modules/irp/src/main/java/org/knightmesh/irp/{IrpApplication,IrpController}.java`
+  - SPM app and example services
+    - `modules/spm/src/main/java/org/knightmesh/spm/SpmApplication.java`
+    - `modules/spm/src/main/java/org/knightmesh/spm/services/{RegisterUserService,UserAuthService}.java`
+  - QPM app and worker
+    - `modules/qpm/src/main/java/org/knightmesh/qpm/{QpmApplication,QpmWorker}.java`
+- plugins
+  - Queue abstraction and impls
+    - `plugins/src/main/java/org/knightmesh/plugins/queue/{QueuePlugin,InMemoryQueuePlugin,PersistentQueuePlugin, PersistentQueueMessage, PersistentQueueMessageRepository}.java`
+- mgm
+  - `mgm/src/main/java/org/knightmesh/mgm/{MgmApplication}.java`
+  - `mgm/src/main/java/org/knightmesh/mgm/api/{MgmController,ModuleView}.java`
+- gateway
+  - `gateway/src/main/java/org/knightmesh/gateway/{GatewayApplication,SecurityConfig,RouteConfig,RequiredRolesGatewayFilterFactory}.java`
+
+---
+
+## Verified request flow (step-by-step)
+
+1) Gateway authorization (WebFlux)
+   - `SecurityConfig` maps Keycloak roles to `ROLE_*` and enforces:
+     - `/mgm/**` → ADMIN, `/irp/**` → USER, `/spm/**` → SERVICE.
+   - `RouteConfig` either loads DB routes (`GatewayRoute`) or uses static fallbacks from properties.
+   - The `Authorization: Bearer <jwt>` header is preserved and forwarded to downstream services (see `GatewaySecurityIntegrationTest`).
+
+2) IRP ingest
+   - `IrpController.post("/irp/{serviceName}")` builds a `ServiceRequest` (metadata includes `timestamp` and `source=IRP`).
+   - IRP reads `ModuleConfig` via `ConfigRepository.getModuleConfig("irp")` to choose `DIRECT` vs `QUEUE`.
+     - `DIRECT`: `ServiceRouter.route(request)` and return body as JSON with 200/400 based on `ServiceResponse.Status`.
+     - `QUEUE`: `QueuePlugin.enqueue(queueName, request)` and `202 ACCEPTED` with `{correlationId}`.
+
+3) ServiceRouter local-first
+   - Looks up `LocalServiceDescriptor` in `LocalServiceRegistry` by `serviceName`.
+   - If `hasCapacity()`: `incrementActive()`, call `descriptor.getInstance().execute(req)` in `try/finally` with `decrementActive()`.
+   - Records metrics via `MeterRegistry` if present.
+
+4) Remote fallback
+   - Uses `RemoteServiceLocator.findInstances(serviceName)` to get `List<ServiceInstance>`.
+   - Chooses instance round-robin and calls `RemoteHttpInvoker.post(instance, request)` which posts to `/internal/service/{serviceName}` with Resilience4j retry + circuit breaker.
+   - On errors after retries (or circuit open), returns `ServiceResponse.failure("SERVICE_UNAVAILABLE", ..)`.
+
+5) SPM services
+   - `@CKServiceRegistration` beans (e.g., `RegisterUserService`, `UserAuthService`) are auto-registered on startup by `LocalServiceAutoRegistrar`.
+   - `RegisterUserService` constructs another `ServiceRequest` and uses `ServiceInvoker` (implemented by `RouterServiceInvoker`) to call `USER_AUTH` locally.
+
+6) QPM asynchronous processing
+   - `QpmWorker` scans enabled modules with `RouteMode=QUEUE` and drains their queues, routing each `ServiceRequest` via `ServiceRouter`.
+
+Tests proving each step:
+- Gateway: `gateway/.../GatewaySecurityIntegrationTest` → JWT required, header forwarded.
+- IRP DIRECT: `modules/irp/.../IrpDirectIntegrationTest` → calls SPM locally.
+- IRP remote fallback: `modules/irp/.../IrpRemoteFallbackIntegrationTest` → capacity saturated, remote WireMock called.
+- Router local: `module-runtime/.../ServiceRouterLocalTest`.
+- Retry/Circuit: `ServiceRouterRetryTest`, `ServiceRouterCircuitBreakerTest`.
+
+---
+
+## Configuration properties (by concern)
+
+- Gateway OIDC:
+  - `spring.security.oauth2.resourceserver.jwt.issuer-uri` (defaults to `${OIDC_ISSUER_URI}` env)
+- Static backend URIs for gateway (fallback when DB has no routes):
+  - `gateway.mgm.uri`, `gateway.irp.uri`, `gateway.spm.uri`
+- Observability common tags (applied by `ObservabilityConfig`):
+  - `observability.module`, `observability.module_type`, `observability.instance_id`
+- Tracing exporter endpoint:
+  - `otel.exporter.otlp.endpoint` (e.g., `http://localhost:4317`)
+- QPM poll frequency:
+  - `qpm.poll.delay.ms` (default 250)
+- Resilience4j (example keys – set at module level):
+  - Retry: `resilience4j.retry.instances.remoteRouter.max-attempts`, `...wait-duration`, `...enable-exponential-backoff`, `...exponential-backoff-multiplier`
+  - Circuit breaker: `resilience4j.circuitbreaker.instances.remoteRouter.*` (e.g., `sliding-window-size`, `wait-duration-in-open-state`)
+
+---
+
+## Database schema and migrations
+
+- Migrations live in `module-runtime/src/main/resources/db/migration` and are applied where Flyway is enabled.
+- Core tables:
+  - `module_config` – desired modules, route mode, queue name, etc.
+  - `service_config` – per-service settings, including `max_threads`.
+  - `gateway_route` – DB-configured gateway routes and roles.
+  - `persistent_queue_message` – used by `PersistentQueuePlugin`.
+- To add a migration, create `V<next>__description.sql` in that folder; Flyway orders by version.
+
+---
+
+## Testcontainers patterns (examples)
+
+- Postgres-backed IRP test: `IrpSpmPostgresIntegrationTest`
+  - Uses `@DynamicPropertySource` to point Spring Data to the container and enables Flyway.
+  - Seeds `ModuleConfig` and performs an HTTP POST to IRP and expects SUCCESS.
+- WireMock-backed remote fallback: `IrpRemoteFallbackIntegrationTest`
+  - Starts WireMock on a dynamic port and provides a `RemoteServiceLocator` bean pointing at it.
+
+---
+
+## Tips for extending
+
+- New CKService: implement the interface, annotate with `@CKServiceRegistration`, and ensure package scanning. Provide `ServiceMetrics` with a sane `maxThreads`.
+- Calling other services: inject `ServiceInvoker` (preferred) instead of `ServiceRouter` to avoid tight coupling and ease future async integration.
+- New queue plugin: implement `QueuePlugin` and register as a Spring bean; configure IRP `RouteMode=QUEUE` in `ModuleConfig` and ensure QPM is running.
+- New gateway route: insert a `GatewayRoute` row (via migration or JPA) and `ConfigRepository.reload()`; verify required roles are enforced by `RequiredRolesGatewayFilterFactory`.
+
